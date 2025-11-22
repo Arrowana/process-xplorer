@@ -9,6 +9,28 @@ struct ProcessExplorerApp {
     sort_ascending: bool,
     refresh_interval: std::time::Duration,
     last_refresh: std::time::Instant,
+    visible_columns: VisibleColumns,
+}
+
+#[derive(Clone)]
+struct VisibleColumns {
+    virtual_memory: bool,
+    parent_pid: bool,
+    start_time: bool,
+    executable_path: bool,
+    working_directory: bool,
+}
+
+impl Default for VisibleColumns {
+    fn default() -> Self {
+        Self {
+            virtual_memory: false,
+            parent_pid: false,
+            start_time: false,
+            executable_path: false,
+            working_directory: false,
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -19,13 +41,18 @@ enum SortColumn {
     Cpu,
     Memory,
     Status,
+    VirtualMemory,
+    ParentPid,
+    StartTime,
+    ExecutablePath,
+    WorkingDirectory,
 }
 
 impl ProcessExplorerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut system = System::new_all();
         system.refresh_all();
-        
+
         Self {
             system,
             selected_pid: None,
@@ -34,6 +61,7 @@ impl ProcessExplorerApp {
             sort_ascending: true,
             refresh_interval: std::time::Duration::from_millis(1000),
             last_refresh: std::time::Instant::now(),
+            visible_columns: VisibleColumns::default(),
         }
     }
 
@@ -75,6 +103,25 @@ impl ProcessExplorerApp {
                     // Status is not directly available, use memory as proxy
                     // This is a placeholder - status sorting could be improved
                     proc_a.memory().cmp(&proc_b.memory())
+                },
+                SortColumn::VirtualMemory => {
+                    proc_a.virtual_memory().cmp(&proc_b.virtual_memory())
+                },
+                SortColumn::ParentPid => {
+                    proc_a.parent().cmp(&proc_b.parent())
+                },
+                SortColumn::StartTime => {
+                    proc_a.start_time().cmp(&proc_b.start_time())
+                },
+                SortColumn::ExecutablePath => {
+                    let exe_a = proc_a.exe().map(|p| p.display().to_string()).unwrap_or_default();
+                    let exe_b = proc_b.exe().map(|p| p.display().to_string()).unwrap_or_default();
+                    exe_a.cmp(&exe_b)
+                },
+                SortColumn::WorkingDirectory => {
+                    let cwd_a = proc_a.cwd().map(|p| p.display().to_string()).unwrap_or_default();
+                    let cwd_b = proc_b.cwd().map(|p| p.display().to_string()).unwrap_or_default();
+                    cwd_a.cmp(&cwd_b)
                 },
             };
             if self.sort_ascending {
@@ -119,6 +166,15 @@ impl eframe::App for ProcessExplorerApp {
                     if ui.button("Exit").clicked() {
                         std::process::exit(0);
                     }
+                });
+                ui.menu_button("View", |ui| {
+                    ui.label("Extra Columns:");
+                    ui.separator();
+                    ui.checkbox(&mut self.visible_columns.virtual_memory, "Virtual Memory");
+                    ui.checkbox(&mut self.visible_columns.parent_pid, "Parent PID");
+                    ui.checkbox(&mut self.visible_columns.start_time, "Start Time");
+                    ui.checkbox(&mut self.visible_columns.executable_path, "Executable Path");
+                    ui.checkbox(&mut self.visible_columns.working_directory, "Working Directory");
                 });
                 ui.menu_button("Process", |ui| {
                     if let Some(pid) = self.selected_pid {
@@ -188,8 +244,16 @@ impl eframe::App for ProcessExplorerApp {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
+                                    // Calculate number of columns
+                                    let mut num_columns = 5; // Default columns: Process, PID, CPU, Memory, Status
+                                    if self.visible_columns.virtual_memory { num_columns += 1; }
+                                    if self.visible_columns.parent_pid { num_columns += 1; }
+                                    if self.visible_columns.start_time { num_columns += 1; }
+                                    if self.visible_columns.executable_path { num_columns += 1; }
+                                    if self.visible_columns.working_directory { num_columns += 1; }
+
                                     egui::Grid::new("process_grid")
-                                        .num_columns(5)
+                                        .num_columns(num_columns)
                                         .spacing([4.0, 2.0])
                                         .striped(true)
                                         .show(ui, |ui| {
@@ -229,6 +293,73 @@ impl eframe::App for ProcessExplorerApp {
                                                 }
                                             }
                                             ui.strong("Status");
+
+                                            // Extra column headers
+                                            if self.visible_columns.virtual_memory {
+                                                if ui.selectable_label(
+                                                    self.sort_column == SortColumn::VirtualMemory,
+                                                    "Virtual Mem"
+                                                ).clicked() {
+                                                    if self.sort_column == SortColumn::VirtualMemory {
+                                                        self.sort_ascending = !self.sort_ascending;
+                                                    } else {
+                                                        self.sort_column = SortColumn::VirtualMemory;
+                                                        self.sort_ascending = false;
+                                                    }
+                                                }
+                                            }
+                                            if self.visible_columns.parent_pid {
+                                                if ui.selectable_label(
+                                                    self.sort_column == SortColumn::ParentPid,
+                                                    "Parent PID"
+                                                ).clicked() {
+                                                    if self.sort_column == SortColumn::ParentPid {
+                                                        self.sort_ascending = !self.sort_ascending;
+                                                    } else {
+                                                        self.sort_column = SortColumn::ParentPid;
+                                                        self.sort_ascending = true;
+                                                    }
+                                                }
+                                            }
+                                            if self.visible_columns.start_time {
+                                                if ui.selectable_label(
+                                                    self.sort_column == SortColumn::StartTime,
+                                                    "Start Time"
+                                                ).clicked() {
+                                                    if self.sort_column == SortColumn::StartTime {
+                                                        self.sort_ascending = !self.sort_ascending;
+                                                    } else {
+                                                        self.sort_column = SortColumn::StartTime;
+                                                        self.sort_ascending = true;
+                                                    }
+                                                }
+                                            }
+                                            if self.visible_columns.executable_path {
+                                                if ui.selectable_label(
+                                                    self.sort_column == SortColumn::ExecutablePath,
+                                                    "Executable"
+                                                ).clicked() {
+                                                    if self.sort_column == SortColumn::ExecutablePath {
+                                                        self.sort_ascending = !self.sort_ascending;
+                                                    } else {
+                                                        self.sort_column = SortColumn::ExecutablePath;
+                                                        self.sort_ascending = true;
+                                                    }
+                                                }
+                                            }
+                                            if self.visible_columns.working_directory {
+                                                if ui.selectable_label(
+                                                    self.sort_column == SortColumn::WorkingDirectory,
+                                                    "Working Dir"
+                                                ).clicked() {
+                                                    if self.sort_column == SortColumn::WorkingDirectory {
+                                                        self.sort_ascending = !self.sort_ascending;
+                                                    } else {
+                                                        self.sort_column = SortColumn::WorkingDirectory;
+                                                        self.sort_ascending = true;
+                                                    }
+                                                }
+                                            }
                                             ui.end_row();
 
                                             // Process rows
@@ -269,9 +400,43 @@ impl eframe::App for ProcessExplorerApp {
                                                     .color(text_color));
                                                 ui.label(egui::RichText::new(self.format_bytes(process.memory()))
                                                     .color(text_color));
-                                                
+
                                                 let status = format!("{:?}", process.status());
                                                 ui.label(status);
+
+                                                // Extra column data
+                                                if self.visible_columns.virtual_memory {
+                                                    ui.label(egui::RichText::new(self.format_bytes(process.virtual_memory()))
+                                                        .color(text_color));
+                                                }
+                                                if self.visible_columns.parent_pid {
+                                                    let parent_str = process.parent()
+                                                        .map(|p| p.as_u32().to_string())
+                                                        .unwrap_or_else(|| "-".to_string());
+                                                    ui.label(egui::RichText::new(parent_str)
+                                                        .color(text_color));
+                                                }
+                                                if self.visible_columns.start_time {
+                                                    ui.label(egui::RichText::new(format!("{}", process.start_time()))
+                                                        .color(text_color));
+                                                }
+                                                if self.visible_columns.executable_path {
+                                                    let exe_str = process.exe()
+                                                        .map(|p| p.display().to_string())
+                                                        .unwrap_or_else(|| "-".to_string());
+                                                    ui.label(egui::RichText::new(exe_str)
+                                                        .color(text_color)
+                                                        .size(10.0));
+                                                }
+                                                if self.visible_columns.working_directory {
+                                                    let cwd_str = process.cwd()
+                                                        .map(|p| p.display().to_string())
+                                                        .unwrap_or_else(|| "-".to_string());
+                                                    ui.label(egui::RichText::new(cwd_str)
+                                                        .color(text_color)
+                                                        .size(10.0));
+                                                }
+
                                                 ui.end_row();
                                             }
                                             
