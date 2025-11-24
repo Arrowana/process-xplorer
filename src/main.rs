@@ -667,6 +667,7 @@ impl eframe::App for ProcessExplorerApp {
 
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
+                                .id_source("process_list_scroll")
                                 .show(ui, |ui| {
                                     // Calculate number of columns
                                     let mut num_columns = 5; // Default columns: Process, PID, CPU, Memory, Status
