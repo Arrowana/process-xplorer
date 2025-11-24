@@ -1,4 +1,5 @@
 use eframe::egui;
+use egui_plot::{Line, Plot, PlotPoints};
 use sysinfo::{Pid, Process, ProcessesToUpdate, System};
 
 struct ProcessExplorerApp {
@@ -10,6 +11,32 @@ struct ProcessExplorerApp {
     refresh_interval: std::time::Duration,
     last_refresh: std::time::Instant,
     visible_columns: VisibleColumns,
+    // Historical data for mini graphs
+    cpu_history: Vec<f64>,
+    memory_history: Vec<f64>,
+    max_history_points: usize,
+    // Resource monitoring window
+    show_resource_window: bool,
+    resource_window: ResourceWindow,
+}
+
+#[derive(Default)]
+struct ResourceWindow {
+    selected_tab: ResourceTab,
+    show_one_graph_per_cpu: bool,
+    cpu_core_histories: Vec<Vec<f64>>,
+    memory_history: Vec<f64>,
+    io_read_history: Vec<f64>,
+    io_write_history: Vec<f64>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum ResourceTab {
+    #[default]
+    Summary,
+    Cpu,
+    Memory,
+    Io,
 }
 
 #[derive(Clone)]
@@ -52,7 +79,10 @@ impl ProcessExplorerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut system = System::new_all();
         system.refresh_all();
+        system.refresh_cpu_all();
 
+        let num_cpus = system.cpus().len().max(1); // Ensure at least 1 CPU
+        
         Self {
             system,
             selected_pid: None,
@@ -62,12 +92,69 @@ impl ProcessExplorerApp {
             refresh_interval: std::time::Duration::from_millis(1000),
             last_refresh: std::time::Instant::now(),
             visible_columns: VisibleColumns::default(),
+            cpu_history: Vec::new(),
+            memory_history: Vec::new(),
+            max_history_points: 60, // Store 60 data points (1 minute at 1 second intervals)
+            show_resource_window: false,
+            resource_window: ResourceWindow {
+                selected_tab: ResourceTab::default(),
+                show_one_graph_per_cpu: true,
+                cpu_core_histories: vec![Vec::new(); num_cpus],
+                memory_history: Vec::new(),
+                io_read_history: Vec::new(),
+                io_write_history: Vec::new(),
+            },
         }
     }
 
     fn refresh_if_needed(&mut self) {
         if self.last_refresh.elapsed() >= self.refresh_interval {
             self.system.refresh_processes(ProcessesToUpdate::All);
+            self.system.refresh_cpu_all();
+            self.system.refresh_memory();
+            
+            // Update historical data
+            let cpu_usage = self.system.global_cpu_usage() as f64;
+            let total_memory = self.system.total_memory();
+            let used_memory = self.system.used_memory();
+            let memory_percent = if total_memory > 0 {
+                (used_memory as f64 / total_memory as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            self.cpu_history.push(cpu_usage);
+            self.memory_history.push(memory_percent);
+            
+            // Update per-CPU core histories
+            let cpus = self.system.cpus();
+            while self.resource_window.cpu_core_histories.len() < cpus.len() {
+                self.resource_window.cpu_core_histories.push(Vec::new());
+            }
+            
+            for (i, cpu) in cpus.iter().enumerate() {
+                if i < self.resource_window.cpu_core_histories.len() {
+                    self.resource_window.cpu_core_histories[i].push(cpu.cpu_usage() as f64);
+                    if self.resource_window.cpu_core_histories[i].len() > self.max_history_points {
+                        self.resource_window.cpu_core_histories[i].remove(0);
+                    }
+                }
+            }
+            
+            // Update resource window memory history
+            self.resource_window.memory_history.push(memory_percent);
+            if self.resource_window.memory_history.len() > self.max_history_points {
+                self.resource_window.memory_history.remove(0);
+            }
+            
+            // Keep only the last N points
+            if self.cpu_history.len() > self.max_history_points {
+                self.cpu_history.remove(0);
+            }
+            if self.memory_history.len() > self.max_history_points {
+                self.memory_history.remove(0);
+            }
+            
             self.last_refresh = std::time::Instant::now();
         }
     }
@@ -150,6 +237,299 @@ impl ProcessExplorerApp {
             format!("{:.2} {}", size, UNITS[unit_idx])
         }
     }
+
+    fn show_mini_plot(&self, ui: &mut egui::Ui, history: &[f64], color: egui::Color32, max_value: f64, plot_id: &str) {
+        if history.is_empty() {
+            return;
+        }
+
+        let points: PlotPoints = history
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| [i as f64, value])
+            .collect();
+
+        let line = Line::new(points)
+            .color(color)
+            .width(1.5);
+
+        Plot::new(plot_id)
+            .height(20.0)
+            .width(80.0)
+            .show_axes([false, false])
+            .show_grid([false, false])
+            .show_background(false)
+            .include_y(0.0)
+            .include_y(max_value)
+            .show(ui, |plot_ui| {
+                plot_ui.line(line);
+            });
+    }
+
+    fn show_resource_window_ui(&mut self, ui: &mut egui::Ui) {
+        // Tabs
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.resource_window.selected_tab, ResourceTab::Summary, "Summary");
+            ui.selectable_value(&mut self.resource_window.selected_tab, ResourceTab::Cpu, "CPU");
+            ui.selectable_value(&mut self.resource_window.selected_tab, ResourceTab::Memory, "Memory");
+            ui.selectable_value(&mut self.resource_window.selected_tab, ResourceTab::Io, "I/O");
+        });
+        ui.separator();
+
+        match self.resource_window.selected_tab {
+            ResourceTab::Summary => self.show_summary_tab(ui),
+            ResourceTab::Cpu => self.show_cpu_tab(ui),
+            ResourceTab::Memory => self.show_memory_tab(ui),
+            ResourceTab::Io => self.show_io_tab(ui),
+        }
+    }
+
+    fn show_summary_tab(&self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.heading("System Summary");
+            ui.separator();
+            
+            let total_memory = self.system.total_memory();
+            let used_memory = self.system.used_memory();
+            let total_swap = self.system.total_swap();
+            let used_swap = self.system.used_swap();
+            let process_count = self.system.processes().len();
+            let cpu_usage = self.system.global_cpu_usage();
+            
+            ui.label(format!("CPU Usage: {:.2}%", cpu_usage));
+            ui.label(format!("Memory: {} / {} ({:.2}%)",
+                self.format_bytes(used_memory),
+                self.format_bytes(total_memory),
+                (used_memory as f64 / total_memory as f64) * 100.0));
+            if total_swap > 0 {
+                ui.label(format!("Swap: {} / {} ({:.2}%)",
+                    self.format_bytes(used_swap),
+                    self.format_bytes(total_swap),
+                    (used_swap as f64 / total_swap as f64) * 100.0));
+            }
+            ui.label(format!("Processes: {}", process_count));
+        });
+    }
+
+    fn show_cpu_tab(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            let cpu_usage = self.system.global_cpu_usage();
+            let cpus = self.system.cpus();
+            
+            ui.horizontal(|ui| {
+                // Overall CPU usage bar
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("CPU").size(16.0).strong());
+                    let bar_height = 200.0;
+                    let bar_width = 60.0;
+                    
+                    let (rect, _) = ui.allocate_at_least(
+                        egui::vec2(bar_width, bar_height),
+                        egui::Sense::hover()
+                    );
+                    
+                    // Background
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgb(40, 40, 40)
+                    );
+                    
+                    // CPU usage fill (from bottom)
+                    let fill_height = bar_height * (cpu_usage / 100.0);
+                    let fill_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x, rect.max.y - fill_height.max(0.0)),
+                        rect.max
+                    );
+                    ui.painter().rect_filled(
+                        fill_rect,
+                        0.0,
+                        egui::Color32::from_rgb(100, 200, 100)
+                    );
+                    
+                    // Label
+                    ui.label(format!("{:.2}%", cpu_usage));
+                });
+                
+                ui.add_space(20.0);
+                
+                // CPU core graphs
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut self.resource_window.show_one_graph_per_cpu, "Show one graph per CPU");
+                    ui.separator();
+                    
+                    if self.resource_window.show_one_graph_per_cpu {
+                        // Grid of CPU graphs
+                        let num_cpus = cpus.len();
+                        let cols = 8.min(num_cpus);
+                        let rows = (num_cpus + cols - 1) / cols;
+                        
+                        egui::Grid::new("cpu_grid")
+                            .num_columns(cols)
+                            .spacing([4.0, 4.0])
+                            .show(ui, |ui| {
+                                for (i, cpu) in cpus.iter().enumerate() {
+                                    ui.vertical(|ui| {
+                                        ui.label(format!("CPU {}", i));
+                                        
+                                        let history: &[f64] = if i < self.resource_window.cpu_core_histories.len() {
+                                            &self.resource_window.cpu_core_histories[i]
+                                        } else {
+                                            &[]
+                                        };
+                                        
+                                        if !history.is_empty() {
+                                            let points: PlotPoints = history
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(j, &value)| [j as f64, value])
+                                                .collect();
+                                            
+                                            let line = Line::new(points)
+                                                .color(egui::Color32::from_rgb(100, 200, 100))
+                                                .width(1.0);
+                                            
+                                            Plot::new(format!("cpu_core_{}", i))
+                                                .height(60.0)
+                                                .width(80.0)
+                                                .show_axes([false, false])
+                                                .show_grid([false, false])
+                                                .show_background(false)
+                                                .include_y(0.0)
+                                                .include_y(100.0)
+                                                .show(ui, |plot_ui| {
+                                                    plot_ui.line(line);
+                                                });
+                                        } else {
+                                            ui.add_sized([80.0, 60.0], egui::Label::new("No data"));
+                                        }
+                                        
+                                        ui.label(format!("{:.1}%", cpu.cpu_usage()));
+                                    });
+                                    
+                                    if (i + 1) % cols == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    } else {
+                        // Single combined graph
+                        if !self.cpu_history.is_empty() {
+                            let points: PlotPoints = self.cpu_history
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &value)| [i as f64, value])
+                                .collect();
+                            
+                            let line = Line::new(points)
+                                .color(egui::Color32::from_rgb(100, 200, 100))
+                                .width(2.0);
+                            
+                            Plot::new("cpu_combined")
+                                .height(200.0)
+                                .width(600.0)
+                                .show_axes([true, true])
+                                .show_grid([true, true])
+                                .include_y(0.0)
+                                .include_y(100.0)
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(line);
+                                });
+                        }
+                    }
+                });
+            });
+            
+            ui.separator();
+            
+            // Statistics
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading("Totals");
+                    ui.label(format!("Processes: {}", self.system.processes().len()));
+                    // Thread count not directly available in sysinfo
+                    ui.label("Threads: N/A");
+                });
+                
+                ui.add_space(20.0);
+                
+                ui.vertical(|ui| {
+                    ui.heading("CPU");
+                    ui.label(format!("Logical Processors: {}", cpus.len()));
+                    ui.label(format!("Cores: {}", cpus.len() / 2.max(1))); // Approximation
+                    ui.label(format!("Sockets: 1")); // Approximation
+                });
+            });
+        });
+    }
+
+    fn show_memory_tab(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            let total_memory = self.system.total_memory();
+            let used_memory = self.system.used_memory();
+            let total_swap = self.system.total_swap();
+            let used_swap = self.system.used_swap();
+            let memory_percent = if total_memory > 0 {
+                (used_memory as f64 / total_memory as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            ui.heading("Memory Usage");
+            ui.separator();
+            
+            // Memory graph
+            if !self.resource_window.memory_history.is_empty() {
+                let points: PlotPoints = self.resource_window.memory_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &value)| [i as f64, value])
+                    .collect();
+                
+                let line = Line::new(points)
+                    .color(egui::Color32::from_rgb(100, 150, 255))
+                    .width(2.0);
+                
+                Plot::new("memory_plot")
+                    .height(300.0)
+                    .width(700.0)
+                    .show_axes([true, true])
+                    .show_grid([true, true])
+                    .include_y(0.0)
+                    .include_y(100.0)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(line);
+                    });
+            }
+            
+            ui.separator();
+            
+            ui.label(format!("Total Memory: {}", self.format_bytes(total_memory)));
+            ui.label(format!("Used Memory: {} ({:.2}%)",
+                self.format_bytes(used_memory),
+                memory_percent));
+            ui.label(format!("Available Memory: {} ({:.2}%)",
+                self.format_bytes(total_memory.saturating_sub(used_memory)),
+                ((total_memory.saturating_sub(used_memory)) as f64 / total_memory as f64) * 100.0));
+            
+            if total_swap > 0 {
+                ui.separator();
+                ui.label(format!("Total Swap: {}", self.format_bytes(total_swap)));
+                ui.label(format!("Used Swap: {} ({:.2}%)",
+                    self.format_bytes(used_swap),
+                    (used_swap as f64 / total_swap as f64) * 100.0));
+            }
+        });
+    }
+
+    fn show_io_tab(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.heading("I/O Statistics");
+            ui.separator();
+            ui.label("I/O statistics are not yet implemented.");
+            ui.label("This would show disk read/write rates and network I/O.");
+        });
+    }
 }
 
 impl eframe::App for ProcessExplorerApp {
@@ -175,6 +555,10 @@ impl eframe::App for ProcessExplorerApp {
                     ui.checkbox(&mut self.visible_columns.start_time, "Start Time");
                     ui.checkbox(&mut self.visible_columns.executable_path, "Executable Path");
                     ui.checkbox(&mut self.visible_columns.working_directory, "Working Directory");
+                    ui.separator();
+                    if ui.button("System Information...").clicked() {
+                        self.show_resource_window = true;
+                    }
                 });
                 ui.menu_button("Process", |ui| {
                     if let Some(pid) = self.selected_pid {
@@ -197,11 +581,39 @@ impl eframe::App for ProcessExplorerApp {
                 let total_swap = self.system.total_swap();
                 let used_swap = self.system.used_swap();
                 let process_count = self.system.processes().len();
+                let memory_percent = if total_memory > 0 {
+                    (used_memory as f64 / total_memory as f64) * 100.0
+                } else {
+                    0.0
+                };
 
+                // CPU mini graph
+                if !self.cpu_history.is_empty() {
+                    self.show_mini_plot(
+                        ui,
+                        &self.cpu_history,
+                        egui::Color32::from_rgb(100, 200, 100),
+                        100.0,
+                        "cpu_plot"
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.label(format!("CPU: {:.2}%", cpu_usage));
                 ui.separator();
+                
+                // Memory mini graph
+                if !self.memory_history.is_empty() {
+                    self.show_mini_plot(
+                        ui,
+                        &self.memory_history,
+                        egui::Color32::from_rgb(100, 150, 255),
+                        100.0,
+                        "memory_plot"
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.label(format!("Memory: {:.2}% ({})", 
-                    (used_memory as f64 / total_memory as f64) * 100.0,
+                    memory_percent,
                     self.format_bytes(used_memory)));
                 ui.separator();
                 if total_swap > 0 {
@@ -213,6 +625,18 @@ impl eframe::App for ProcessExplorerApp {
                 ui.label(format!("Processes: {}", process_count));
             });
         });
+
+        // Resource monitoring window
+        let mut window_open = self.show_resource_window;
+        egui::Window::new("System Information")
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([800.0, 600.0])
+            .show(ctx, |ui| {
+                self.show_resource_window_ui(ui);
+            });
+        self.show_resource_window = window_open;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
